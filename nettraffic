@@ -1,0 +1,151 @@
+#!/bin/bash
+
+# NetTraffic – Simple live traffic monitor per remote IP
+# Usage: sudo ./nettraffic
+
+set -e  # Exit on error
+
+# ------------------------------------------------------------
+# Configuration (auto‑detected)
+# ------------------------------------------------------------
+INTERFACE=$(ip route 2>/dev/null | awk '/default/ {print $5; exit}')
+if [[ -z "$INTERFACE" ]]; then
+    echo "ERROR: Could not detect default network interface."
+    exit 1
+fi
+
+MYIP=$(ip -4 addr show "$INTERFACE" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1)
+if [[ -z "$MYIP" ]]; then
+    echo "ERROR: Could not detect IPv4 address on interface $INTERFACE."
+    exit 1
+fi
+
+# ------------------------------------------------------------
+# Check prerequisites
+# ------------------------------------------------------------
+if [[ $EUID -ne 0 ]]; then
+    echo "This script must be run as root (use sudo)."
+    exit 1
+fi
+
+for cmd in tcpdump awk; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "ERROR: $cmd not found. Please install it."
+        exit 1
+    fi
+done
+
+# ------------------------------------------------------------
+# Cleanup on exit
+# ------------------------------------------------------------
+cleanup() {
+    echo -e "\nExiting."
+    exit 0
+}
+trap cleanup SIGINT SIGTERM
+
+# ------------------------------------------------------------
+# Main live monitoring
+# ------------------------------------------------------------
+echo "Monitoring traffic on interface $INTERFACE (local IP: $MYIP)"
+echo "Press Ctrl+C to stop."
+
+# Start tcpdump and pipe into awk for aggregation and display
+# Options:
+#   -i $INTERFACE : capture on detected interface
+#   -n            : don't resolve hostnames
+#   -l            : line‑buffered output (for real‑time processing)
+#   -q            : quick output (less verbose)
+#   tcp or udp    : capture only TCP and UDP traffic
+tcpdump -i "$INTERFACE" -n -l -q tcp or udp 2>/dev/null | awk -v myip="$MYIP" '
+
+BEGIN {
+    # Clear screen once at start
+    printf "\033[2J\033[H"
+    print "Traffic per Remote IP (updated every packet)"
+    print "------------------------------------------------------------"
+    printf "%-20s %-15s %-15s %-10s %-10s\n",
+           "Remote IP", "Out Bytes", "In Bytes", "Out Pkts", "In Pkts"
+    print "------------------------------------------------------------"
+}
+
+{
+    # -----------------------------------------------------------------
+    # Parse tcpdump line (IPv4 only)
+    # Expected format: "12:34:56.789012 IP 1.2.3.4.12345 > 5.6.7.8.80: ..."
+    # -----------------------------------------------------------------
+    # Split source field (e.g., "1.2.3.4.12345") into parts
+    split($3, src_parts, ".")
+    if (length(src_parts) < 5) next   # not a valid IPv4 packet with port
+
+    src_ip = src_parts[1] "." src_parts[2] "." src_parts[3] "." src_parts[4]
+    src_port = src_parts[5]
+
+    # Destination field ends with colon, e.g., "5.6.7.8.80:"
+    split($5, dst_parts, ".")
+    if (length(dst_parts) < 5) next
+
+    dst_ip = dst_parts[1] "." dst_parts[2] "." dst_parts[3] "." dst_parts[4]
+    # Remove trailing colon from port part
+    dst_port_part = dst_parts[5]
+    gsub(/:$/, "", dst_port_part)
+    dst_port = dst_port_part
+
+    # -----------------------------------------------------------------
+    # Determine direction and remote IP
+    # -----------------------------------------------------------------
+    if (src_ip == myip) {
+        direction = "OUT"
+        remote_ip = dst_ip
+    } else {
+        direction = "IN"
+        remote_ip = src_ip
+    }
+
+    # -----------------------------------------------------------------
+    # Extract packet length (if present)
+    # -----------------------------------------------------------------
+    bytes = 0
+    if (match($0, /length [0-9]+/)) {
+        bytes = substr($0, RSTART+7, RLENGTH-7)
+    } else if (match($0, /len [0-9]+/)) {
+        bytes = substr($0, RSTART+4, RLENGTH-4)
+    }
+
+    # -----------------------------------------------------------------
+    # Update counters
+    # -----------------------------------------------------------------
+    if (direction == "OUT") {
+        out_bytes[remote_ip] += bytes
+        out_pkts[remote_ip]++
+    } else {
+        in_bytes[remote_ip] += bytes
+        in_pkts[remote_ip]++
+    }
+
+    # -----------------------------------------------------------------
+    # Refresh the display
+    # -----------------------------------------------------------------
+    # Move cursor to top of screen (home) and redraw
+    printf "\033[H"
+
+    # Print header
+    print "Traffic per Remote IP (updated every packet)"
+    print "------------------------------------------------------------"
+    printf "%-20s %-15s %-15s %-10s %-10s\n",
+           "Remote IP", "Out Bytes", "In Bytes", "Out Pkts", "In Pkts"
+    print "------------------------------------------------------------"
+
+    # Print all remote IPs (union of out and in keys)
+    # First, collect all unique IPs
+    for (ip in out_bytes) {
+        printf "%-20s %-15d %-15d %-10d %-10d\n",
+               ip, out_bytes[ip], in_bytes[ip], out_pkts[ip], in_pkts[ip]
+    }
+    for (ip in in_bytes) {
+        if (!(ip in out_bytes)) {
+            printf "%-20s %-15d %-15d %-10d %-10d\n",
+                   ip, 0, in_bytes[ip], 0, in_pkts[ip]
+        }
+    }
+}'
